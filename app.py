@@ -1,11 +1,10 @@
-import copy
 import csv
 import io
-import json
-import hashlib
+import html
+import logging
+import time
 
 import gspread
-import pandas as pd
 import streamlit as st
 from engine import scan, csv_bytes, col_name
 
@@ -17,6 +16,42 @@ st.markdown('''<style>
 .hero{padding:28px;background:#172f3d;color:white;border-radius:18px;margin-bottom:24px}.hero h2{color:white;margin:0}.hero p{color:#c1d3dc;margin-bottom:0}
 </style>''', unsafe_allow_html=True)
 DEFAULT_URL = 'https://docs.google.com/spreadsheets/d/1LfcJLtbO4p9_j4PyrggdPjCz1Crq2vfQ3z7IMI_FNe4/edit?gid=1220686951#gid=1220686951'
+
+
+def preview_table(headers, records):
+    """Small HTML preview avoids native Arrow serialization of uploaded data."""
+    headers = list(headers)[:15]
+    def cell(value):
+        return html.escape(str(value)[:240])
+    head = ''.join(f'<th>{cell(h)}</th>' for h in headers)
+    body = ''.join('<tr>' + ''.join(f'<td>{cell(row[i]) if i < len(row) else ""}</td>' for i in range(len(headers))) + '</tr>' for row in list(records)[:10])
+    st.markdown('<div style="overflow:auto;max-height:360px"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>', unsafe_allow_html=True)
+    st.caption('Preview: first 10 rows and 15 columns. Full data is retained for scanning and export.')
+
+def record_csv(records, fields):
+    output = io.StringIO(newline='')
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(records)
+    return output.getvalue().encode('utf-8-sig')
+
+def read_upload(upload):
+    if upload.size > 50 * 1024 * 1024:
+        raise ValueError('This hosted app accepts CSV files up to 50 MB. Split the inventory into smaller files.')
+    upload.seek(0)
+    text = io.TextIOWrapper(upload, encoding='utf-8-sig', newline='')
+    parsed, cells = [], 0
+    try:
+        for row in csv.reader(text):
+            cells += len(row)
+            if cells > 2_000_000:
+                raise ValueError('This file exceeds 2 million cells. Split the inventory into smaller files.')
+            parsed.append(row)
+    finally:
+        text.detach()
+    if not parsed or not any(parsed[0]):
+        raise ValueError('CSV is empty or its first row has no column headers.')
+    return parsed
 
 def sheet_client():
     if 'gcp_service_account' not in st.secrets:
@@ -33,12 +68,15 @@ with st.sidebar:
         upload = st.file_uploader('Inventory CSV', type=['csv'])
         if upload:
             try:
-                rows = list(csv.reader(io.StringIO(upload.getvalue().decode('utf-8-sig'))))
-                identity = ('csv', hashlib.sha256(upload.getvalue()).hexdigest())
+                identity = ('csv', upload.file_id)
                 if st.session_state.get('identity') != identity:
+                    with st.spinner('Reading inventory…'):
+                        rows = read_upload(upload)
                     st.session_state.update(rows=rows, identity=identity, result=None, worksheet=None)
             except Exception as exc:
-                st.error(f'Could not read UTF-8 CSV: {exc}')
+                logging.exception('Inventory CSV load failed')
+                st.error(f'Could not load CSV: {exc}')
+                st.stop()
     else:
         sheet_url = st.text_input('Spreadsheet URL', DEFAULT_URL)
         worksheet_name = st.text_input('Worksheet', 'Sheet2')
@@ -66,6 +104,7 @@ if not rows or st.session_state.get('identity', ('',))[0] != ('csv' if source ==
     c.markdown('**03 · Export or apply**\n\nDownload a cleaned CSV or update selected sheet cells.')
     st.stop()
 
+st.caption(f'Loaded {len(rows):,} rows · upload-safe build 3')
 width = max(map(len, rows))
 labels = [f'{col_name(i+1)} · {rows[0][i] if i < len(rows[0]) and rows[0][i] else "Unnamed"}' for i in range(width)]
 st.markdown('### Scan settings')
@@ -74,20 +113,27 @@ stock_col = a.selectbox('Stock number column', range(width), format_func=lambda 
 image_cols = b.multiselect('Image columns', range(width), default=list(range(1,min(width,9))), format_func=lambda i:labels[i])
 start_row = c.number_input('Start row', 1, len(rows), min(2,len(rows)))
 threshold = d.number_input('pHash distance', 0, 16, 2, help='0 = identical hashes. Higher values find broader visual similarities. Review jewelry variations carefully.')
-workers = st.select_slider('Parallel workers', [4,8,16,32], value=16)
+workers = st.select_slider('Parallel workers', [2,4,8,16], value=4)
 config = (stock_col, tuple(image_cols), start_row, threshold)
 with st.expander('Preview source data'):
-    st.dataframe(pd.DataFrame([r+['']*(width-len(r)) for r in rows[:11]], columns=labels), width="stretch")
+    preview_table(labels, rows[1:11])
 if st.button('Scan for duplicates →', type='primary', disabled=len(image_cols)<2):
     if stock_col in image_cols:
         st.error('The stock number column cannot also be an image column.')
     else:
         bar = st.progress(0, text='Preparing image scan…')
+        last_progress = [0.0]
+        def update_progress(done, total):
+            now = time.monotonic()
+            if done == total or now-last_progress[0] >= .3:
+                bar.progress(done/total, text=f'Scanning row {done:,} of {total:,}')
+                last_progress[0] = now
         try:
             matches, errors = scan(rows, start_row-1, stock_col, sorted(image_cols), threshold, workers,
-                                   lambda done,total:bar.progress(done/total, text=f'Scanning row {done:,} of {total:,}'))
-            st.session_state.result = dict(matches=matches, errors=errors, config=config, baseline=copy.deepcopy(rows))
-            st.session_state.pop('review_table', None)
+                                   update_progress)
+            st.session_state.result = dict(matches=matches, errors=errors, config=config, baseline=rows)
+            st.session_state['excluded_matches'] = set()
+            st.session_state['review_version'] = st.session_state.get('review_version', 0) + 1
             bar.empty()
         except Exception as exc:
             st.error(f'Scan failed: {exc}')
@@ -111,9 +157,17 @@ with review_tab:
         st.success('No duplicate candidates found at this threshold.')
     else:
         st.caption('Select which image URLs to clear. No changes have been made to your source.')
-        table = pd.DataFrame([{'Clear':True,'Row':m['row']+1,'Stock number':m['stock'], 'Keep':col_name(m['original_col']+1),'Clear column':col_name(m['col']+1),'Distance':m['distance']} for m in matches])
-        edited = st.data_editor(table, hide_index=True, disabled=list(table.columns[1:]), key='review_table', width="stretch")
-        selected = [m for m, clear in zip(matches,edited['Clear']) if clear]
+        excluded = st.session_state.setdefault('excluded_matches', set())
+        version = st.session_state.get('review_version', 0)
+        page = st.number_input('Review page', 1, max(1, (len(matches)+19)//20), 1)
+        for i in range((page-1)*20, min(page*20, len(matches))):
+            m = matches[i]
+            clear = st.checkbox(f"Row {m['row']+1} · {m['stock']} · Clear {col_name(m['col']+1)}, keep {col_name(m['original_col']+1)} · distance {m['distance']}", value=i not in excluded, key=f'clear_{version}_{i}')
+            if clear:
+                excluded.discard(i)
+            else:
+                excluded.add(i)
+        selected = [m for i,m in enumerate(matches) if i not in excluded]
         pick = st.selectbox('Inspect a match', range(len(matches)), format_func=lambda i:f'Row {matches[i]["row"]+1} · {matches[i]["stock"]} · {col_name(matches[i]["col"]+1)}')
         match = matches[pick]
         left,right=st.columns(2)
@@ -124,20 +178,23 @@ with review_tab:
                 st.text(url)
 with error_tab:
     if errors:
-        st.dataframe(pd.DataFrame(errors).assign(row=lambda x:x.row+1), hide_index=True, width="stretch")
-        st.download_button('Download error report', pd.DataFrame(errors).assign(row=lambda x:x.row+1).to_csv(index=False).encode(), 'image_errors.csv')
+        error_records = [{**e, 'row':e['row']+1} for e in errors]
+        preview_table(['Row','Stock','Column','URL','Error'], [[e['row'],e['stock'],e['column'],e['url'],e['error']] for e in error_records[:10]])
+        st.download_button('Download error report', record_csv(error_records, ['row','stock','column','url','error']), 'image_errors.csv')
     else:
         st.success('No image download or decoding errors.')
 
-cleaned=copy.deepcopy(result['baseline'])
+changes = {}
 for m in selected:
-    cleaned[m['row']][m['col']]=''
+    changes.setdefault(m['row'], set()).add(m['col'])
+cleaned = ([('' if col in changes.get(index, set()) else value) for col,value in enumerate(row)] for index,row in enumerate(result['baseline']))
 st.divider()
 st.markdown('### Export & apply')
 a,b=st.columns(2)
 a.download_button(f'Download cleaned CSV · {len(selected):,} URLs cleared', csv_bytes(cleaned), 'inventory_cleaned.csv', mime='text/csv', width="stretch")
-report = pd.DataFrame([{**m,'row':m['row']+1,'selected':m in selected} for m in matches])
-b.download_button('Download duplicate audit', report.to_csv(index=False).encode('utf-8-sig'), 'duplicate_audit.csv', width="stretch")
+selected_cells = {(m['row'], m['col']) for m in selected}
+report = [{**m,'row':m['row']+1,'selected':(m['row'],m['col']) in selected_cells} for m in matches]
+b.download_button('Download duplicate audit', record_csv(report, ['row','stock','col','original_col','url','original_url','distance','selected']), 'duplicate_audit.csv', width="stretch")
 worksheet=st.session_state.get('worksheet')
 if source=='Google Sheets' and worksheet:
     st.caption('Only selected duplicate URL cells are cleared. Other columns and formulas are preserved. Updates use batches of 500 cells.')
