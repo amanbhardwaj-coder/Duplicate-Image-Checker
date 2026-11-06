@@ -1,4 +1,6 @@
-streamlit>=1.40,<2
+# Deploy with Python 3.12 selected in Streamlit Advanced settings.
+streamlit==1.50.0
+pyarrow==24.0.0
 Pillow>=11,<13
 requests>=2.32,<3
 ImageHash>=4.3,<5
