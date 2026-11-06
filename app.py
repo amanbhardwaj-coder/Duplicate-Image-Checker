@@ -42,7 +42,7 @@ with st.sidebar:
     else:
         sheet_url = st.text_input('Spreadsheet URL', DEFAULT_URL)
         worksheet_name = st.text_input('Worksheet', 'Sheet2')
-        if st.button('Connect & load', use_container_width=True):
+        if st.button('Connect & load', width="stretch"):
             try:
                 worksheet = sheet_client().open_by_url(sheet_url).worksheet(worksheet_name)
                 rows = worksheet.get_all_values(value_render_option='FORMULA')
@@ -77,7 +77,7 @@ threshold = d.number_input('pHash distance', 0, 16, 2, help='0 = identical hashe
 workers = st.select_slider('Parallel workers', [4,8,16,32], value=16)
 config = (stock_col, tuple(image_cols), start_row, threshold)
 with st.expander('Preview source data'):
-    st.dataframe(pd.DataFrame([r+['']*(width-len(r)) for r in rows[:11]], columns=labels), use_container_width=True)
+    st.dataframe(pd.DataFrame([r+['']*(width-len(r)) for r in rows[:11]], columns=labels), width="stretch")
 if st.button('Scan for duplicates →', type='primary', disabled=len(image_cols)<2):
     if stock_col in image_cols:
         st.error('The stock number column cannot also be an image column.')
@@ -112,7 +112,7 @@ with review_tab:
     else:
         st.caption('Select which image URLs to clear. No changes have been made to your source.')
         table = pd.DataFrame([{'Clear':True,'Row':m['row']+1,'Stock number':m['stock'], 'Keep':col_name(m['original_col']+1),'Clear column':col_name(m['col']+1),'Distance':m['distance']} for m in matches])
-        edited = st.data_editor(table, hide_index=True, disabled=list(table.columns[1:]), key='review_table', use_container_width=True)
+        edited = st.data_editor(table, hide_index=True, disabled=list(table.columns[1:]), key='review_table', width="stretch")
         selected = [m for m, clear in zip(matches,edited['Clear']) if clear]
         pick = st.selectbox('Inspect a match', range(len(matches)), format_func=lambda i:f'Row {matches[i]["row"]+1} · {matches[i]["stock"]} · {col_name(matches[i]["col"]+1)}')
         match = matches[pick]
@@ -124,7 +124,7 @@ with review_tab:
                 st.text(url)
 with error_tab:
     if errors:
-        st.dataframe(pd.DataFrame(errors).assign(row=lambda x:x.row+1), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(errors).assign(row=lambda x:x.row+1), hide_index=True, width="stretch")
         st.download_button('Download error report', pd.DataFrame(errors).assign(row=lambda x:x.row+1).to_csv(index=False).encode(), 'image_errors.csv')
     else:
         st.success('No image download or decoding errors.')
@@ -135,9 +135,9 @@ for m in selected:
 st.divider()
 st.markdown('### Export & apply')
 a,b=st.columns(2)
-a.download_button(f'Download cleaned CSV · {len(selected):,} URLs cleared', csv_bytes(cleaned), 'inventory_cleaned.csv', mime='text/csv', use_container_width=True)
+a.download_button(f'Download cleaned CSV · {len(selected):,} URLs cleared', csv_bytes(cleaned), 'inventory_cleaned.csv', mime='text/csv', width="stretch")
 report = pd.DataFrame([{**m,'row':m['row']+1,'selected':m in selected} for m in matches])
-b.download_button('Download duplicate audit', report.to_csv(index=False).encode('utf-8-sig'), 'duplicate_audit.csv', use_container_width=True)
+b.download_button('Download duplicate audit', report.to_csv(index=False).encode('utf-8-sig'), 'duplicate_audit.csv', width="stretch")
 worksheet=st.session_state.get('worksheet')
 if source=='Google Sheets' and worksheet:
     st.caption('Only selected duplicate URL cells are cleared. Other columns and formulas are preserved. Updates use batches of 500 cells.')
