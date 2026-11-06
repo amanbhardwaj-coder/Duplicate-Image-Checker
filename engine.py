@@ -13,6 +13,8 @@ from urllib3.util.retry import Retry
 
 _local = threading.local()
 MAX_BYTES = 20 * 1024 * 1024
+MAX_PIXELS = 12_000_000
+_decode_slots = threading.BoundedSemaphore(2)
 
 def session():
     if not hasattr(_local, 'session'):
@@ -27,19 +29,32 @@ def session():
 def get_hash(url):
     if urlparse(url).scheme not in ('http', 'https'):
         raise ValueError('Only HTTP and HTTPS image URLs are supported')
-    with session().get(url, timeout=(5, 20), stream=True) as response:
-        response.raise_for_status()
-        content = bytearray()
-        for chunk in response.iter_content(65536):
-            content.extend(chunk)
-            if len(content) > MAX_BYTES:
-                raise ValueError('Image exceeds 20 MB limit')
-    with Image.open(io.BytesIO(content)) as source:
-        source = ImageOps.exif_transpose(source)
-        rgba = source.convert('RGBA')
-        bg = Image.new('RGBA', rgba.size, 'white')
-        bg.alpha_composite(rgba)
-        return imagehash.phash(bg.convert('RGB'))
+    # Bound both downloaded buffers and decoded images across all scan workers.
+    # Network-worker count no longer multiplies full-resolution image memory.
+    with _decode_slots:
+        with session().get(url, timeout=(5, 20), stream=True) as response:
+            response.raise_for_status()
+            content = bytearray()
+            for chunk in response.iter_content(65536):
+                content.extend(chunk)
+                if len(content) > MAX_BYTES:
+                    raise ValueError('Image exceeds 20 MB limit')
+        with Image.open(io.BytesIO(content)) as source:
+            if source.width * source.height > MAX_PIXELS:
+                raise ValueError('Image exceeds 12 megapixel hosted processing limit; URL preserved')
+            # JPEG draft decoding reduces memory before the full pixel buffer exists.
+            source.draft('RGB', (512, 512))
+            source.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                with oriented.convert('RGBA') as rgba:
+                    with Image.new('RGBA', rgba.size, 'white') as bg:
+                        bg.alpha_composite(rgba)
+                        with bg.convert('RGB') as rgb:
+                            return imagehash.phash(rgb)
+            finally:
+                if oriented is not source:
+                    oriented.close()
 
 def process_row(index, row, stock_col, image_cols, threshold):
     kept, matches, errors = [], [], []
